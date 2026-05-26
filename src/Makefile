@@ -56,6 +56,16 @@ mr-build: .FORCE check-version
 	(cd mrapps && go build $(RACE) -buildmode=plugin crash.go) || exit 1
 	(cd mrapps && go build $(RACE) -buildmode=plugin nocrash.go) || exit 1
 
+.ONESHELL: mr-try-run
+mr-try-run:
+	set -e
+	go run main/mrcoordinator.go sock_tmp pg-grimm.txt &
+	pid=$$!
+	sleep 1
+	go build -buildmode=plugin -o wc.so mrapps/wc.go
+	go run main/mrworker.go wc.so sock_tmp
+	kill $$pid
+
 .PHONY: .FORCE $(MAINS) $(MAIN_BUILDS)
 
 # -race with plug-ins on x86 MacOS 12 with go1.17 before 1.17.6 sometimes crash.

@@ -1,11 +1,12 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -23,9 +24,10 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
-func Worker(sockname string, mapf func(string, string) []KeyValue,
+func Worker(
+	sockname string,
+	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	coordSockName = sockname
@@ -35,30 +37,35 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+	job := TaskRequest()
+	job.run(mapf, reducef)
+	TaskDone(job.Id)
+}
+
+func TaskRequest() *Task {
+	// Your code here to request a task from the coordinator.
+	return nil
+}
+
+func TaskDone(taskId int) {
+	// Your code here to notify the coordinator that
+	// the task with taskId has been completed.
 }
 
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
 func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
+	req := ExampleReq{X: 99}
+	res := ExampleRes{}
 
 	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
+	// CoordinatorExample tells the
 	// receiving server that we'd like to call
 	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
+	if ok := call(CoordinatorExample, &req, &res); ok {
+		// res.Y should be 100.
+		fmt.Printf("res.Y %v\n", res.Y)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
@@ -67,15 +74,15 @@ func CallExample() {
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	c, err := rpc.DialHTTP("unix", coordSockName)
+func call(rpcEndpoint string, req interface{}, res interface{}) bool {
+	// client, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	client, err := rpc.DialHTTP("unix", coordSockName)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
-	defer c.Close()
+	defer client.Close()
 
-	if err := c.Call(rpcname, args, reply); err == nil {
+	if err := client.Call(rpcEndpoint, req, res); err == nil {
 		return true
 	}
 	log.Printf("%d: call failed err %v", os.Getpid(), err)

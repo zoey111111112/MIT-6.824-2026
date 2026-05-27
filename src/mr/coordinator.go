@@ -1,11 +1,13 @@
 package mr
 
 import (
+	"container/list"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 /*
@@ -102,14 +104,13 @@ MapReduce 任务整体流程：
 		所有 reduce task 都完成后返回 true
 */
 
-type Task struct {
-	Id  int
-	run func(mapf func(string, string) []KeyValue, reducef func(string, []string) string)
-}
-
 type Coordinator struct {
-	// Your definitions here.
-
+	stage      Stage
+	taskPool   *list.List
+	finished   map[int]struct{}
+	totalTasks int
+	nReduce    int
+	timers     map[int]*time.Timer
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -117,9 +118,137 @@ type Coordinator struct {
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleReq, reply *ExampleRes) error {
-	reply.Y = args.X + 1
-	return nil
+
+// create a Coordinator.
+// main/mrcoordinator.go calls this function.
+// nReduce is the number of reduce tasks to use.
+func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
+	c := Coordinator{
+		stage:      StageMap,
+		taskPool:   list.New(),
+		finished:   make(map[int]struct{}),
+		totalTasks: len(files),
+		nReduce:    nReduce,
+		timers:     make(map[int]*time.Timer),
+	}
+
+	for i, filename := range files {
+		c.taskPool.PushBack(Task{
+			Id:       i,
+			TaskType: TaskMap,
+			Filename: filename,
+			nReduce:  nReduce,
+		})
+	}
+
+	c.server(sockname)
+	c.runManager()
+	return &c
+}
+
+type Request struct {
+	message string
+	payload interface{}
+	replyCh chan Task
+}
+
+var reqCh chan Request = make(chan Request, 100)
+
+// Manager thread
+func (c *Coordinator) runManager() {
+	go func() {
+		for {
+			log.Println("[Manager] Waiting for requests...")
+			req := <-reqCh
+			log.Printf("[Manager] Received request: %s", req.message)
+			switch req.message {
+			case "on_task_req":
+				switch c.stage {
+				case StageMap, StageReduce:
+					if c.taskPool.Len() > 0 {
+						// assign a task to worker
+						task := c.taskPool.Remove(c.taskPool.Front()).(Task)
+						log.Printf("[Manager] Assigning %s task ID=%d, remaining tasks in pool=%d",
+							map[TaskType]string{TaskMap: "MAP", TaskReduce: "REDUCE"}[task.TaskType],
+							task.Id, c.taskPool.Len())
+						// start a timer for this task
+						c.timers[task.Id] = time.AfterFunc(time.Second*10, func() {
+							reqCh <- Request{
+								message: "on_task_timeout",
+								payload: task,
+							}
+						})
+
+						req.replyCh <- task
+
+					} else {
+						// no task available, tell worker to wait
+						log.Printf("[Manager] No tasks available in stage %v, sending wait signal", c.stage)
+						req.replyCh <- Task{TaskType: TaskWait}
+					}
+				case StageDone:
+					// job done, tell worker to exit
+					log.Printf("[Manager] Job complete, sending exit signal to worker")
+					req.replyCh <- Task{TaskType: TaskExit}
+				}
+
+			case "on_task_done":
+				// update finished tasks
+				task_id, ok := req.payload.(int)
+				if !ok {
+					log.Printf("Invalid payload for on_task_done: %v", req.payload)
+					continue
+				}
+				c.timers[task_id].Stop()
+				delete(c.timers, task_id)
+
+				c.finished[task_id] = struct{}{}
+				log.Printf("[Manager] Task %d completed, finished %d/%d tasks in stage %v",
+					task_id, len(c.finished), c.totalTasks, c.stage)
+
+				// if can go to next stage
+				if len(c.finished) == c.totalTasks && c.stage == StageMap {
+					c.stage = StageReduce
+					c.finished = make(map[int]struct{})
+					c.totalTasks = c.nReduce
+					c.taskPool.Init()
+					for i := 0; i < c.nReduce; i++ {
+						c.taskPool.PushBack(Task{
+							Id:       i,
+							TaskType: TaskReduce,
+						})
+					}
+					log.Printf("All map tasks done, move to reduce stage (nReduce=%d)", c.nReduce)
+
+				} else if len(c.finished) == c.totalTasks && c.stage == StageReduce {
+					c.stage = StageDone
+					log.Printf("All reduce tasks done, job complete")
+				}
+			case "on_task_timeout":
+				task, ok := req.payload.(Task)
+				if !ok {
+					log.Printf("Invalid payload for on_task_timeout: %v", req.payload)
+					continue
+				}
+				// if task not finished, put it back to pool
+				if _, ok := c.finished[task.Id]; !ok {
+					log.Printf("Task %d timeout, reassigning", task.Id)
+					c.taskPool.PushBack(task)
+				} else {
+					log.Printf("[Manager] Task %d timeout but already completed, skipping", task.Id)
+				}
+			case "on_check_done":
+				if c.stage == StageDone {
+					log.Printf("[Manager] Job is done, sending exit signal")
+					req.replyCh <- Task{TaskType: TaskExit}
+				} else {
+					log.Printf("[Manager] Job not done yet, sending wait signal")
+					req.replyCh <- Task{TaskType: TaskWait}
+				}
+			}
+		}
+	}()
+
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -136,24 +265,46 @@ func (c *Coordinator) server(sockname string) {
 	go http.Serve(listener, nil)
 }
 
+func (c *Coordinator) Example(args *ExampleReq, reply *ExampleRes) error {
+	reply.Y = args.X + 1
+	return nil
+}
+
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	replyCh := make(chan Task)
+	reqCh <- Request{
+		message: "on_check_done",
+		replyCh: replyCh,
+	}
+	task := <-replyCh
+	return task.TaskType == TaskExit
 }
 
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
-func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+func (c *Coordinator) TaskRequest(req *TaskRequestReq, res *TaskRequestRes) error {
+	log.Printf("Received TaskRequest from worker")
 
-	// Your code here.
+	replyCh := make(chan Task)
+	reqCh <- Request{
+		message: "on_task_req",
+		replyCh: replyCh,
+	}
 
-	c.server(sockname)
-	return &c
+	task := <-replyCh
+	res.Task = &task
+	log.Printf("Assigned task %v to worker", task)
+
+	return nil
+}
+
+func (c *Coordinator) TaskDone(req *TaskDoneReq, res *TaskDoneRes) error {
+	log.Printf("Received TaskDone for task %d", req.TaskId)
+
+	reqCh <- Request{
+		message: "on_task_done",
+		payload: req.TaskId,
+	}
+
+	return nil
 }

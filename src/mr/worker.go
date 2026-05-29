@@ -134,34 +134,28 @@ func ExecReduceTask(reduceId int, reducef func(string, []string) string) error {
 	})
 
 	outFileName := fmt.Sprintf("mr-out-%d", reduceId)
-	outFile, err := os.Create(outFileName)
-	if err != nil {
-		log.Printf("Failed to create output file %s: %v", outFileName, err)
-		return err
-	}
-	defer outFile.Close()
+	return writeAtomic(outFileName, func(outFile *os.File) error {
+		for i := 0; i < len(intermediate); {
+			j := i + 1
+			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				j++
+			}
 
-	for i := 0; i < len(intermediate); {
-		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-			j++
+			values := make([]string, 0, j-i)
+			for k := i; k < j; k++ {
+				values = append(values, intermediate[k].Value)
+			}
+
+			output := reducef(intermediate[i].Key, values)
+			if _, err := fmt.Fprintf(outFile, "%s %s\n", intermediate[i].Key, output); err != nil {
+				log.Printf("Failed to write reduce output to %s: %v", outFileName, err)
+				return err
+			}
+
+			i = j
 		}
-
-		values := make([]string, 0, j-i)
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
-		}
-
-		output := reducef(intermediate[i].Key, values)
-		if _, err := fmt.Fprintf(outFile, "%s %s\n", intermediate[i].Key, output); err != nil {
-			log.Printf("Failed to write reduce output to %s: %v", outFileName, err)
-			return err
-		}
-
-		i = j
-	}
-
-	return nil
+		return nil
+	})
 }
 
 func ExecMapTask(task *Task, mapf func(string, string) []KeyValue) error {
@@ -183,24 +177,50 @@ func ExecMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 
 	for i, bucket := range buckets {
 		intermediateFileName := fmt.Sprintf("mr-%d-%d", task.Id, i)
-
-		// create tmp file at curr dir
-		f, err := os.Create(intermediateFileName)
-		if err != nil {
-			log.Printf("Failed to create intermediate file %s: %v", intermediateFileName, err)
-			return err
-		}
-		defer f.Close()
-
-		for _, kv := range bucket {
-			_, err := fmt.Fprintf(f, "%s %s\n", kv.Key, kv.Value)
-			if err != nil {
-				log.Printf("Failed to write to intermediate file %s: %v", intermediateFileName, err)
-				return err
+		if err := writeAtomic(intermediateFileName, func(f *os.File) error {
+			for _, kv := range bucket {
+				_, err := fmt.Fprintf(f, "%s %s\n", kv.Key, kv.Value)
+				if err != nil {
+					log.Printf("Failed to write to intermediate file %s: %v", intermediateFileName, err)
+					return err
+				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+func writeAtomic(filename string, write func(*os.File) error) error {
+	tmpFile, err := os.CreateTemp(".", filename+".tmp-*")
+	if err != nil {
+		log.Printf("Failed to create temporary file for %s: %v", filename, err)
+		return err
+	}
+	tmpName := tmpFile.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err := write(tmpFile); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		log.Printf("Failed to close temporary file %s: %v", tmpName, err)
+		return err
+	}
+	if err := os.Rename(tmpName, filename); err != nil {
+		log.Printf("Failed to rename temporary file %s to %s: %v", tmpName, filename, err)
+		return err
+	}
+	removeTmp = false
 	return nil
 }
 

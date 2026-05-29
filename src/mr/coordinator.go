@@ -137,7 +137,7 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 			Id:       i,
 			TaskType: TaskMap,
 			Filename: filename,
-			nReduce:  nReduce,
+			NReduce:  nReduce,
 		})
 	}
 

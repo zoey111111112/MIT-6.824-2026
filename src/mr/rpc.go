@@ -71,7 +71,7 @@ type Task struct {
 	Id       int
 	TaskType TaskType
 	Filename string // 仅 map task 需要
-	nReduce  int    // 仅 map task 需要
+	NReduce  int    // 仅 map task 需要
 }
 
 const CoordinatorTaskRequest string = "Coordinator.TaskRequest"

@@ -1,10 +1,16 @@
 package mr
 
 import (
+	"bufio"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"net/rpc"
 	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,7 +54,7 @@ func Worker(
 
 		switch task.TaskType {
 		case TaskMap:
-			if err := ExecMapTask(task.Filename, mapf); err == nil {
+			if err := ExecMapTask(task, mapf); err == nil {
 				TaskDone(task.Id)
 			} else {
 				log.Printf("Failed to execute MapTask %d: %v", task.Id, err)
@@ -72,14 +78,129 @@ func Worker(
 	}
 }
 
-func ExecReduceTask(i int, reducef func(string, []string) string) error {
-	time.Sleep(time.Second)
-	log.Printf("ExecReduceTask %d", i)
+func ExecReduceTask(reduceId int, reducef func(string, []string) string) error {
+	log.Printf("ExecReduceTask %d", reduceId)
+
+	intermediate := make([]KeyValue, 0)
+	files, err := os.ReadDir(".")
+	if err != nil {
+		log.Printf("Failed to read directory: %v", err)
+		return err
+	}
+
+	reduceRe := regexp.MustCompile(`^mr-[0-9]+-([0-9]+)$`)
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		matches := reduceRe.FindStringSubmatch(file.Name())
+		if matches == nil {
+			continue
+		}
+
+		fileReduceId, err := strconv.Atoi(matches[1])
+		if err != nil {
+			log.Printf("Failed to parse reduce ID from %s: %v", file.Name(), err)
+			continue
+		}
+		if fileReduceId != reduceId {
+			continue
+		}
+
+		content, err := os.ReadFile(file.Name())
+		if err != nil {
+			log.Printf("Failed to read intermediate file %s: %v", file.Name(), err)
+			return err
+		}
+
+		scanner := bufio.NewScanner(strings.NewReader(string(content)))
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.SplitN(line, " ", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			intermediate = append(intermediate, KeyValue{Key: parts[0], Value: parts[1]})
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("Failed to scan intermediate file %s: %v", file.Name(), err)
+			return err
+		}
+	}
+
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+
+	outFileName := fmt.Sprintf("mr-out-%d", reduceId)
+	outFile, err := os.Create(outFileName)
+	if err != nil {
+		log.Printf("Failed to create output file %s: %v", outFileName, err)
+		return err
+	}
+	defer outFile.Close()
+
+	for i := 0; i < len(intermediate); {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		values := make([]string, 0, j-i)
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+
+		output := reducef(intermediate[i].Key, values)
+		if _, err := fmt.Fprintf(outFile, "%s %s\n", intermediate[i].Key, output); err != nil {
+			log.Printf("Failed to write reduce output to %s: %v", outFileName, err)
+			return err
+		}
+
+		i = j
+	}
+
 	return nil
 }
 
-func ExecMapTask(s string, mapf func(string, string) []KeyValue) error {
-	log.Printf("ExecMapTask %s", s)
+func ExecMapTask(task *Task, mapf func(string, string) []KeyValue) error {
+	log.Printf("TaskId %v ExecMapTask %s", task.Id, task.Filename)
+
+	content, err := os.ReadFile(task.Filename)
+	if err != nil {
+		log.Printf("Failed to read file %s: %v", task.Filename, err)
+		return err
+	}
+
+	buckets := make([][]KeyValue, task.NReduce)
+
+	kvList := mapf(task.Filename, string(content))
+	for _, kv := range kvList {
+		reduceId := ihash(kv.Key) % task.NReduce
+		buckets[reduceId] = append(buckets[reduceId], kv)
+	}
+
+	for i, bucket := range buckets {
+		intermediateFileName := fmt.Sprintf("mr-%d-%d", task.Id, i)
+
+		// create tmp file at curr dir
+		f, err := os.Create(intermediateFileName)
+		if err != nil {
+			log.Printf("Failed to create intermediate file %s: %v", intermediateFileName, err)
+			return err
+		}
+		defer f.Close()
+
+		for _, kv := range bucket {
+			_, err := fmt.Fprintf(f, "%s %s\n", kv.Key, kv.Value)
+			if err != nil {
+				log.Printf("Failed to write to intermediate file %s: %v", intermediateFileName, err)
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 

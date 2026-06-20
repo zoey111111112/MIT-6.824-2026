@@ -38,7 +38,7 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role Role
+	state Role
 
 	currentTerm int
 	votedFor    int
@@ -50,13 +50,8 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	resetTickerCh chan bool
-	closeTickerCh chan bool
-
-	electionChan chan bool
-
-	sendHeartBeatCh  chan bool
-	closeHeartBeatCh chan bool
+	electionTimer  *time.Timer
+	heartBeatTimer *time.Timer
 }
 
 type Log struct {
@@ -78,7 +73,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 	term = rf.currentTerm
-	isleader = (rf.role == Leader)
+	isleader = (rf.state == Leader)
 	return term, isleader
 }
 
@@ -191,7 +186,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.role = Follower
+		rf.state = Follower
 	}
 
 	// 3. 检查是否已投票
@@ -202,10 +197,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 4. 投票
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
-
-	if rf.role == Follower {
-		rf.resetElectionTimer()
-	}
+	// 重置选举计时器
+	rf.electionTimer.Reset(time.Duration(randomElectionTimeout()) * time.Millisecond)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -250,15 +243,17 @@ func (rf *Raft) HeartBeat(args *AppendEntries, reply *AppendEntriesReply) {
 	term := rf.currentTerm
 	reply.Term = term
 	reply.Success = true
-	if args.Term > term {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.role = Follower
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
 	}
-	// 重置选举超时计时器
-	go func() {
-		rf.resetTickerCh <- true
-	}()
+	rf.currentTerm = args.Term
+	rf.state = Follower
+	if args.Term > term {
+		rf.votedFor = -1
+	}
+	// 重置选举计时器
+	rf.electionTimer.Reset(time.Duration(randomElectionTimeout()) * time.Millisecond)
 	// if args.Term < rf.currentTerm || len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
 	// 	reply.Success = false
 	// 	reply.Term = rf.currentTerm
@@ -300,55 +295,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-func (rf *Raft) ticker() {
-	for true {
-		ms := 300 + (rand.Int63() % 300)
-		select {
-		case <-rf.resetTickerCh:
-			continue
-		case <-rf.closeTickerCh:
-			return
-		case <-time.After(time.Duration(ms) * time.Millisecond):
-			rf.electionChan <- true
-		}
-
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		// ms := 50 + (rand.Int63() % 300)
-		// time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
-func (rf *Raft) resetElectionTimer() {
-	go func() {
-		rf.resetTickerCh <- true
-	}()
-}
-func (rf *Raft) closeElectionTimer() {
-	go func() {
-		rf.closeTickerCh <- true
-	}()
-}
-func (rf *Raft) closeHeartBeatTimer() {
-	go func() {
-		rf.closeHeartBeatCh <- true
-	}()
-}
-
-func (rf *Raft) heartBeatTicker() {
-	for {
-		select {
-		case <-rf.closeHeartBeatCh:
-			return
-		case <-time.After(100 * time.Millisecond):
-			rf.sendHeartBeatCh <- true
-		}
-	}
-}
-
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -364,43 +310,56 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.votedFor = -1
 
 	// Your initialization code here (3A, 3B, 3C).
-	rf.resetTickerCh = make(chan bool)
-	rf.closeTickerCh = make(chan bool)
-	rf.sendHeartBeatCh = make(chan bool)
-
-	rf.closeHeartBeatCh = make(chan bool)
-	rf.electionChan = make(chan bool)
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	rf.electionTimer = time.NewTimer(time.Duration(randomElectionTimeout()) * time.Millisecond)
+	rf.heartBeatTimer = time.NewTimer(100 * time.Millisecond)
+
 	go rf.ticker()
-	go rf.run()
 
 	return rf
 }
 
-func (rf *Raft) run() {
+func (rf *Raft) ticker() {
 	for {
 		select {
-		case <-rf.sendHeartBeatCh:
-			go rf.handleSendHeartBeat()
-		case <-rf.electionChan:
-			go rf.election()
-
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			if rf.state != Leader {
+				rf.currentTerm++
+				rf.votedFor = rf.me
+				rf.state = Candidate
+				term := rf.currentTerm
+				// 异步触发选举流程
+				go rf.election(term)
+				//reset计时器
+			}
+			rf.electionTimer.Reset(time.Duration(randomElectionTimeout()) * time.Millisecond)
+			rf.mu.Unlock()
+		case <-rf.heartBeatTimer.C:
+			rf.mu.Lock()
+			if rf.state == Leader {
+				term := rf.currentTerm
+				go rf.handleSendHeartBeat(term)
+			}
+			rf.heartBeatTimer.Reset(100 * time.Millisecond)
+			rf.mu.Unlock()
 		}
 	}
 }
 
+func randomElectionTimeout() int64 {
+	return 300 + (rand.Int63() % 300)
+}
+
 // 发送心跳
 // 可能会发生状态转变 : Leader -> Follower
-func (rf *Raft) handleSendHeartBeat() {
-	rf.mu.RLock()
-	term := rf.currentTerm
-	rf.mu.RUnlock()
+func (rf *Raft) handleSendHeartBeat(term int) {
 	heartBeat := &AppendEntries{
 		Term:     term,
 		LeaderId: rf.me,
@@ -409,62 +368,63 @@ func (rf *Raft) handleSendHeartBeat() {
 		// Entries:      []Log{},
 		// LeaderCommit: rf.commitIndex,
 	}
-	heartBeatReply := make(chan *AppendEntriesReply)
+	heartBeatReply := make(chan *AppendEntriesReply, len(rf.peers))
 	for index := range rf.peers {
 		if index == rf.me {
 			continue
 		}
 		reply := &AppendEntriesReply{}
 		go func() {
-			rf.sendHeartBeat(index, heartBeat, reply)
-			heartBeatReply <- reply
+			ok := rf.sendHeartBeat(index, heartBeat, reply)
+			if ok {
+				heartBeatReply <- reply
+			} else {
+				heartBeatReply <- nil
+			}
 		}()
 	}
 	replyCount := 0
 	for replyCount < len(rf.peers)-1 {
 		reply := <-heartBeatReply
 		replyCount++
+		if reply == nil {
+			continue
+		}
 		if !reply.Success && reply.Term > term {
 			rf.mu.Lock()
-			rf.role = Follower
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			// 关闭心跳计时器
-			rf.closeHeartBeatTimer()
-			// 开启选举超时计时器
-			go rf.ticker()
-			rf.mu.Unlock()
-			break
+			defer rf.mu.Unlock()
+			// 检查当前任期是不是还小于回复消息的任期
+			if rf.currentTerm < reply.Term {
+				rf.state = Follower
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+			}
+			return
 		}
-
 	}
 }
-func (rf *Raft) election() {
-	rf.mu.Lock()
-	rf.role = Candidate
-	rf.currentTerm++
-	rf.votedFor = rf.me
-	term := rf.currentTerm
-	rf.mu.Unlock()
-	go func() {
-		rf.resetTickerCh <- true
-	}()
+func (rf *Raft) election(term int) {
 	args := &RequestVoteArgs{
 		Term:        term,
 		CandidateId: rf.me,
 		// LastLogIndex: len(rf.log) - 1,
 		// LastLogTerm:  rf.log[len(rf.log)-1].term,
 	}
-
-	voteChan := make(chan *RequestVoteReply)
+	voteChan := make(chan *RequestVoteReply, len(rf.peers))
 	for index := range rf.peers {
 		if index == rf.me {
 			continue
 		}
 		reply := &RequestVoteReply{}
 		go func() {
-			rf.sendRequestVote(index, args, reply)
-			voteChan <- reply
+			// rf.sendRequestVote(index, args, reply)
+			// voteChan <- reply
+			ok := rf.sendRequestVote(index, args, reply)
+			if ok {
+				voteChan <- reply
+			} else {
+				voteChan <- nil // 或者其他标记失败的手段
+			}
 		}()
 	}
 	voteGranted := 1
@@ -473,34 +433,32 @@ func (rf *Raft) election() {
 	for replyCount < len(rf.peers)-1 {
 		reply := <-voteChan
 		replyCount++
+		if reply == nil {
+			continue
+		}
 		if reply.VoteGranted {
 			if voteGranted++; voteGranted >= majority {
 				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				// 检查现在的任期是否已经过时了，如果过时了就不转换为leader了
 				if rf.currentTerm > term {
 					return
 				}
-				rf.role = Leader
-				// 关闭选举超时计时器
-				rf.closeElectionTimer()
-				// 开启定期发送心跳计时器
-				go rf.heartBeatTicker()
-				rf.mu.Unlock()
-				break
+				rf.state = Leader
+				go rf.handleSendHeartBeat(rf.currentTerm)
+				return
 			}
 		} else if reply.Term > term {
 			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			// 当前选举结果作废
 			if rf.currentTerm > term {
 				return
 			}
-			rf.currentTerm = term
+			rf.currentTerm = reply.Term
 			rf.votedFor = -1
-			rf.role = Follower
-			// 开启选举超时计时器
-			go rf.ticker()
-			rf.mu.Unlock()
-			break
+			rf.state = Follower
+			return
 		}
 	}
 }

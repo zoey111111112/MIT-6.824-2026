@@ -255,9 +255,6 @@ func (rf *Raft) AppendEntries(args *AppendEntries, reply *AppendEntriesReply) {
 		return
 	}
 
-	// 只要 Term 合法，哪怕日志不匹配，也说明 Leader 活着，必须重置计时器！
-	rf.electionTimer.Reset(time.Duration(randomElectionTimeout()) * time.Millisecond)
-
 	rf.state = Follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
@@ -278,7 +275,12 @@ func (rf *Raft) AppendEntries(args *AppendEntries, reply *AppendEntriesReply) {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.XTerm = rf.log[args.PrevLogIndex].Term
-
+		// for i := range args.PrevLogIndex {
+		// 	if rf.log[args.PrevLogIndex-i].Term != reply.XTerm {
+		// 		reply.XIndex = args.PrevLogIndex - i + 1
+		// 		break
+		// 	}
+		// }
 		reply.XIndex = args.PrevLogIndex
 		for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == reply.XTerm {
 			reply.XIndex--
@@ -287,6 +289,10 @@ func (rf *Raft) AppendEntries(args *AppendEntries, reply *AppendEntriesReply) {
 		return
 	}
 
+	// 截断后面的日志
+	// rf.log = rf.log[:args.PrevLogIndex+1]
+	// rf.log = append(rf.log, args.Entries...)
+	// 替换那两行代码：
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
 		if idx < len(rf.log) {
@@ -308,8 +314,8 @@ func (rf *Raft) AppendEntries(args *AppendEntries, reply *AppendEntriesReply) {
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	// // 重置选举计时器
-	// rf.electionTimer.Reset(time.Duration(randomElectionTimeout()) * time.Millisecond)
+	// 重置选举计时器
+	rf.electionTimer.Reset(time.Duration(randomElectionTimeout()) * time.Millisecond)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -421,7 +427,7 @@ func (rf *Raft) ticker() {
 		case <-rf.heartBeatTimer.C:
 			rf.mu.Lock()
 			if rf.state == Leader {
-				go rf.handleSendAppendEntries()
+				go rf.handleSendHeartBeat()
 			}
 			rf.heartBeatTimer.Reset(100 * time.Millisecond)
 			rf.mu.Unlock()
@@ -433,7 +439,9 @@ func randomElectionTimeout() int64 {
 	return 300 + (rand.Int63() % 300)
 }
 
-func (rf *Raft) handleSendAppendEntries() {
+// 发送心跳
+// 可能会发生状态转变 : Leader -> Follower
+func (rf *Raft) handleSendHeartBeat() {
 	rf.mu.Lock()
 	msgMap := make(map[int]*AppendEntries)
 	term := rf.currentTerm
@@ -443,7 +451,7 @@ func (rf *Raft) handleSendAppendEntries() {
 		}
 		var entries []Log
 		if rf.nextIndex[server] == len(rf.log) {
-			entries = make([]Log, 0)
+			entries = []Log{}
 		} else {
 			entries = make([]Log, len(rf.log[rf.nextIndex[server]:]))
 			copy(entries, rf.log[rf.nextIndex[server]:])
@@ -486,6 +494,82 @@ func (rf *Raft) handleSendAppendEntries() {
 			continue
 		}
 		rf.mu.Lock()
+		if rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Success {
+			rf.matchIndex[reply.Server] = msgMap[reply.Server].PrevLogIndex + len(msgMap[reply.Server].Entries)
+			rf.nextIndex[reply.Server] = rf.matchIndex[reply.Server] + 1
+			rf.advanceCommitIndexLocked() // 新增：即使是心跳回复也尝试推进 commitIndex
+		} else {
+			if reply.Term > term {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.state = Follower
+				rf.persist()
+				rf.mu.Unlock()
+				return
+			} else {
+				// rf.nextIndex[reply.Server]--
+				rf.setNextIndex(msgMap[reply.Server], reply)
+				go rf.fillLog(reply.Server, term)
+			}
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) handleSendAppendEntries() {
+	rf.mu.Lock()
+	msgMap := make(map[int]*AppendEntries)
+	term := rf.currentTerm
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+		entries := make([]Log, len(rf.log[rf.nextIndex[server]:]))
+		copy(entries, rf.log[rf.nextIndex[server]:])
+		appendEntries := &AppendEntries{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.nextIndex[server] - 1,
+			PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+		msgMap[server] = appendEntries
+	}
+	rf.mu.Unlock()
+
+	appendEntriesReplyCh := make(chan *AppendEntriesReply, len(rf.peers))
+
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+		go func(index int) {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(index, msgMap[index], reply)
+			if ok {
+				reply.Server = index
+				appendEntriesReplyCh <- reply
+			} else {
+				appendEntriesReplyCh <- nil
+			}
+		}(server)
+	}
+
+	replyCount := 0
+	// copied := 1
+	// majority := len(rf.peers)/2 + 1
+	for replyCount < len(rf.peers)-1 {
+		reply := <-appendEntriesReplyCh
+		replyCount++
+		if reply == nil {
+			continue
+		}
+		rf.mu.Lock()
 		// 旧的任期已结束
 		if rf.currentTerm != term {
 			rf.mu.Unlock()
@@ -495,6 +579,12 @@ func (rf *Raft) handleSendAppendEntries() {
 			rf.matchIndex[reply.Server] = msgMap[reply.Server].PrevLogIndex + len(msgMap[reply.Server].Entries)
 			rf.nextIndex[reply.Server] = rf.matchIndex[reply.Server] + 1
 			rf.advanceCommitIndexLocked()
+			// if copied++; copied >= majority {
+			// 	rf.advanceCommitIndexLocked()
+			// 	rf.applyCond.Signal()
+			// 	rf.mu.Unlock()
+			// 	return
+			// }
 		} else {
 			if reply.Term > term {
 				rf.currentTerm = reply.Term
@@ -505,6 +595,58 @@ func (rf *Raft) handleSendAppendEntries() {
 				return
 			} else {
 				rf.setNextIndex(msgMap[reply.Server], reply)
+				// go rf.fillLog(reply.Server, term)
+			}
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) fillLog(server int, term int) {
+	for {
+		rf.mu.Lock()
+		if term != rf.currentTerm {
+			rf.mu.Unlock()
+			return
+		}
+		entries := make([]Log, len(rf.log[rf.nextIndex[server]:]))
+		copy(entries, rf.log[rf.nextIndex[server]:])
+		appendEntries := &AppendEntries{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.nextIndex[server] - 1,
+			PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		// 未收到来自节点的回复，则退出，下一个心跳周期再发送
+		if ok := rf.sendAppendEntries(server, appendEntries, reply); !ok {
+			return
+		}
+		reply.Server = server
+		rf.mu.Lock()
+		if rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Success {
+			rf.matchIndex[reply.Server] = appendEntries.PrevLogIndex + len(appendEntries.Entries)
+			rf.nextIndex[reply.Server] = rf.matchIndex[reply.Server] + 1
+			rf.mu.Unlock()
+			return
+		} else {
+			if reply.Term > term {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.state = Follower
+				rf.persist()
+				rf.mu.Unlock()
+				return
+			} else {
+				rf.setNextIndex(appendEntries, reply)
 			}
 		}
 		rf.mu.Unlock()
@@ -569,8 +711,10 @@ func (rf *Raft) election(term int) {
 		if index == rf.me {
 			continue
 		}
+		reply := &RequestVoteReply{}
 		go func(index int) {
-			reply := &RequestVoteReply{}
+			// rf.sendRequestVote(index, args, reply)
+			// voteChan <- reply
 			ok := rf.sendRequestVote(index, args, reply)
 			if ok {
 				voteChan <- reply
@@ -603,7 +747,7 @@ func (rf *Raft) election(term int) {
 					rf.nextIndex[i] = len(rf.log)
 				}
 				rf.matchIndex = make([]int, len(rf.peers))
-				go rf.handleSendAppendEntries()
+				go rf.handleSendHeartBeat()
 				return
 			}
 		} else if reply.Term > term {

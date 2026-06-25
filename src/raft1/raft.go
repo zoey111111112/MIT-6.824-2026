@@ -441,80 +441,74 @@ func randomElectionTimeout() int64 {
 
 func (rf *Raft) handleSendAppendEntries() {
 	rf.mu.Lock()
-	msgMap := make(map[int]*AppendEntries)
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
 	term := rf.currentTerm
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
+
+		// 准备该节点的参数
+		prevLogIndex := rf.nextIndex[server] - 1
+		prevLogTerm := rf.log[prevLogIndex].Term
+
 		var entries []Log
-		if rf.nextIndex[server] == len(rf.log) {
-			entries = make([]Log, 0)
-		} else {
+		if rf.nextIndex[server] < len(rf.log) {
+			// 只有在有新日志时才进行切片和复制
 			entries = make([]Log, len(rf.log[rf.nextIndex[server]:]))
 			copy(entries, rf.log[rf.nextIndex[server]:])
 		}
-		appendEntries := &AppendEntries{
+		args := &AppendEntries{
 			Term:         term,
 			LeaderId:     rf.me,
-			PrevLogIndex: rf.nextIndex[server] - 1,
-			PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
 			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
-		msgMap[server] = appendEntries
+		// 为每个节点启动协程
+		go func(target int, request *AppendEntries) {
+			reply := &AppendEntriesReply{}
+			if ok := rf.sendAppendEntries(target, request, reply); ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// 1. 检查 Term 和身份是否依然合法
+				if rf.currentTerm != term || rf.state != Leader {
+					return
+				}
+				reply.Server = target
+
+				if reply.Success {
+					// 2. 关键优化：保护 matchIndex 单调递增
+					newMatch := request.PrevLogIndex + len(request.Entries)
+					if newMatch > rf.matchIndex[target] {
+						rf.matchIndex[target] = newMatch
+						rf.nextIndex[target] = newMatch + 1
+						// 只有 matchIndex 推进了，才尝试移动 commitIndex
+						rf.advanceCommitIndexLocked()
+					}
+				} else {
+					// 3. 处理失败
+					if reply.Term > term {
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.state = Follower
+						rf.persist()
+					} else {
+						// 4. 快速回退优化
+						// rf.optimizeNextIndex(target, request, reply)
+						rf.setNextIndex(request, reply)
+					}
+				}
+			}
+		}(server, args)
 	}
 	rf.mu.Unlock()
-
-	appendEntriesReplyCh := make(chan *AppendEntriesReply, len(rf.peers))
-
-	for server := range rf.peers {
-		if server == rf.me {
-			continue
-		}
-		go func(index int) {
-			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(index, msgMap[index], reply)
-			if ok {
-				reply.Server = index
-				appendEntriesReplyCh <- reply
-			} else {
-				appendEntriesReplyCh <- nil
-			}
-		}(server)
-	}
-
-	replyCount := 0
-	for replyCount < len(rf.peers)-1 {
-		reply := <-appendEntriesReplyCh
-		replyCount++
-		if reply == nil {
-			continue
-		}
-		rf.mu.Lock()
-		// 旧的任期已结束
-		if rf.currentTerm != term {
-			rf.mu.Unlock()
-			return
-		}
-		if reply.Success {
-			rf.matchIndex[reply.Server] = msgMap[reply.Server].PrevLogIndex + len(msgMap[reply.Server].Entries)
-			rf.nextIndex[reply.Server] = rf.matchIndex[reply.Server] + 1
-			rf.advanceCommitIndexLocked()
-		} else {
-			if reply.Term > term {
-				rf.currentTerm = reply.Term
-				rf.votedFor = -1
-				rf.state = Follower
-				rf.persist()
-				rf.mu.Unlock()
-				return
-			} else {
-				rf.setNextIndex(msgMap[reply.Server], reply)
-			}
-		}
-		rf.mu.Unlock()
-	}
 }
 
 func (rf *Raft) setNextIndex(args *AppendEntries, reply *AppendEntriesReply) {

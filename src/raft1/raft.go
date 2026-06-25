@@ -182,14 +182,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-	if args.Term < rf.currentTerm || args.LastLogTerm < rf.log[len(rf.log)-1].Term {
-		return
-	}
-	if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1 {
-		return
-	}
+	// 首先处理任期
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -197,6 +190,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persist()
 	}
 
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	// 1. 任期检查
+	if args.Term < rf.currentTerm {
+		return
+	}
+	if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+		return
+	}
+	if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1 {
+		return
+	}
 	// 3. 检查是否已投票
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		return // 本任期已投给别人
